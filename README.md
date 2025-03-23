@@ -6,14 +6,26 @@ Find existing files in Telegram channels that has not been uploaded using Teldri
 ## TODO (perhaps)
 
 - Use the Teldrive API instead of modifying DB directly.
+- Add options to filter for certain files with support for regex. For example match all `r'.*\.mp[34]'` but not any of mime type *'image/jpeg'*.
+- Add support for DB URI strings (postgresql://...)
+- Add support for the reverse: removing files from the Teldrive database (but not from channel)
+- Add support for redoing an import
 
 ## Prerequisites
 
 - python3
 - pip
-- telegram API ID, API hash and associated phone number
-- teldrive server
-- teldrive DB name, username, password, host and port
+- Telegram
+  - API ID
+  - API hash
+  - associated phone number
+- Teldrive
+  - PostgreSQL database
+    - name
+    - username
+    - password
+    - host
+    - port
 - some files perhaps
 
 ## Installation
@@ -27,6 +39,18 @@ pip install -r requirements.txt
 ```
 
 ## Usage
+
+> [!CAUTION]
+> It is always good advice to make a backup of your database before you start.
+
+> [!CAUTION]
+> **Possible Unintended Consequences:** This goes without saying, but Teldrive manages these files the same as any other file uploaded through Teldrive once they are added to the Teldrive database. If you delete an imported file using the Teldrive Web UI or Rclone, it will eventually be permanently removed from the associated Telegram channel by the Teldrive cron job (a background maintenance program) after the time period specified by `--cronjobs-clean-files-interval`.
+> 
+> If you run this script and happen to need or want to redo the import for any reason, **do not** delete the files using Teldrive or Rclone and expect that they will be removed only from the database. A file deleted in Teldrive will be removed from the database *along with the source file in the Telegram channel.*
+>
+> **This is your responsibility.**
+
+<br>
 
 Get the Telegram API ID and hash from your teldrive `config.toml` file:
 
