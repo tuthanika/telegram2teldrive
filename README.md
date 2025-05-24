@@ -30,11 +30,20 @@ Find existing files in Telegram channels that has not been uploaded using Teldri
 
 ## Installation
 
+For Linux/MacOS:
 ```shell
 git clone https://github.com/iwconfig/telegram2teldrive
 cd telegram2teldrive
 python3 -m venv pyvenv
 source pyvenv/bin/activate
+pip install -r requirements.txt
+```
+For Windows:
+```shell
+git clone https://github.com/iwconfig/telegram2teldrive
+cd telegram2teldrive
+python3 -m venv pyvenv
+pyvenv/Scripts/activate
 pip install -r requirements.txt
 ```
 
