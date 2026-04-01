@@ -279,6 +279,22 @@ def get_or_create_folder(conn, user_id, parent_id, folder_name, dry_run=False):
     return row[0]
 
 
+def resolve_folder_path(conn, user_id, root_id, folder_path, dry_run=False):
+    """Walk a '/'-separated folder path starting from *root_id*,
+    creating each segment if it doesn't exist.
+
+    '1/subfolder' resolves:  root -> '1' -> 'subfolder'
+    '2'           resolves:  root -> '2'
+    """
+    parts = [p.strip() for p in folder_path.replace("\\", "/").split("/") if p.strip()]
+    if not parts:
+        return root_id
+    current_id = root_id
+    for part in parts:
+        current_id = get_or_create_folder(conn, user_id, current_id, part, dry_run)
+    return current_id
+
+
 def file_exists(conn, user_id, channel_id, message_id):
     row = fetch_one(
         conn,
@@ -558,7 +574,7 @@ async def main():
 
         for pair_idx, (folder_name, channels_str) in enumerate(args.folder_channel_pairs, 1):
             logger.info("=== Pair %s: folder=%r channels=%r ===", pair_idx, folder_name, channels_str or "(interactive)")
-            base_id = get_or_create_folder(conn, user_id, root_id, folder_name, args.dry_run)
+            base_id = resolve_folder_path(conn, user_id, root_id, folder_name, args.dry_run)
 
             # Determine whether to use media-type sub-folders
             use_media_subfolders = channels_str is not None
