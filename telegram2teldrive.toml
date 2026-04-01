@@ -1,0 +1,46 @@
+[telegram]
+api-id = "xx"
+api-hash = "xxx"
+phone-number = "xxx"
+
+[db]
+data-source = "postgresql://xxx:xxx@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
+
+[teldrive] 
+#folder_name1 = "DIY"
+#channels1 = "2121310723"
+  
+#folder_name2 = "Music"
+#channels2 = "1171239640"
+ 
+#folder_name3 = "MV"
+#channels3 = "1789610832"
+
+#folder_name4 = "Ebook"
+#channels4 = "1352806217"
+#tach4 = true
+#rule4 = "prc:PRC,epub:EPUB,mobi:PRC"
+
+#folder_name5 = "Show"
+#channels5 = "1882820820"
+
+#folder_name6 = "Phim Le"
+#channels6 = "1555461770"
+
+#folder_name7 = "Phim Bo"
+#channels7 = "1579345443"
+
+#folder_name8 = "x"    # defaults to "Imported"
+#channels8 = "1445612186"
+#tach8 = true
+
+#folder_name9 = "x-full"
+#channels9 = "1522647954
+#tach9 = true
+
+
+
+
+
+
+
