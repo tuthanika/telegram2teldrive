@@ -238,33 +238,40 @@ def reorganize_folder(conn, user_id, base_folder_id, base_folder_name, dry_run=F
     logger.info("Folder '%s': found %s files to reorganize (%s direct, %s from sub-folders)",
                 base_folder_name, len(all_files), len(direct_files), len(channel_files))
 
-    # 3. Build media sub-folder cache
-    media_folder_cache = {}
-    moved = 0
-
+    # 3. Group files by target sub-folder for bulk updates
+    #    {sf_name: [file_id, ...]}
+    subfolder_groups = {}
     for file_id, file_name, mime_type, source in all_files:
         category = get_category(file_name, mime_type)
         sf_name = get_subfolder_name(category)
+        subfolder_groups.setdefault(sf_name, []).append((file_id, file_name))
 
-        if sf_name not in media_folder_cache:
-            media_folder_cache[sf_name] = get_or_create_folder(
-                conn, user_id, base_folder_id, sf_name, dry_run,
-            )
-
-        target_parent = media_folder_cache[sf_name]
-
+    moved = 0
+    for sf_name, file_list in subfolder_groups.items():
         if dry_run:
-            logger.info("  [DRY-RUN] Would move '%s' -> /%s/%s/", file_name, base_folder_name, sf_name)
-        else:
+            for _, fname in file_list:
+                logger.info("  [DRY-RUN] Would move '%s' -> /%s/%s/", fname, base_folder_name, sf_name)
+            moved += len(file_list)
+            continue
+
+        target_parent = get_or_create_folder(conn, user_id, base_folder_id, sf_name, dry_run=False)
+        file_ids = [fid for fid, _ in file_list]
+
+        # Bulk update in batches of 500
+        batch_size = 500
+        for i in range(0, len(file_ids), batch_size):
+            batch = file_ids[i:i + batch_size]
             execute(
                 conn,
-                "UPDATE teldrive.files SET parent_id = %s, updated_at = NOW() WHERE id = %s",
-                (target_parent, file_id),
+                "UPDATE teldrive.files SET parent_id = %s, updated_at = NOW() WHERE id = ANY(%s::uuid[])",
+                (target_parent, batch),
             )
-        moved += 1
+            conn.commit()
+            logger.info("  /%s/%s/: batch %s-%s of %s committed",
+                        base_folder_name, sf_name, i + 1, min(i + batch_size, len(file_ids)), len(file_ids))
 
-    if not dry_run:
-        conn.commit()
+        moved += len(file_ids)
+        logger.info("  /%s/%s/: %s files moved", base_folder_name, sf_name, len(file_ids))
 
     logger.info("Folder '%s': moved %s files into media sub-folders", base_folder_name, moved)
 
