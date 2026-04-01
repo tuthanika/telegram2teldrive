@@ -328,13 +328,17 @@ def main():
             seen_indices.add(m.group(1))
     for idx in sorted(seen_indices, key=int):
         fn = teldrive_cfg.get(f"folder_name{idx}", "")
+        tach = teldrive_cfg.get(f"tach{idx}", False)
+        is_tach = str(tach).strip().lower() == "true" if isinstance(tach, str) else bool(tach)
         if fn:
-            folder_names.append(fn)
+            folder_names.append((fn, is_tach))
 
     # Fallback to single folder_name
     if not folder_names:
         fn = teldrive_cfg.get("folder_name", "Imported")
-        folder_names.append(fn)
+        tach_global = teldrive_cfg.get("tach", False)
+        is_tach_global = str(tach_global).strip().lower() == "true" if isinstance(tach_global, str) else bool(tach_global)
+        folder_names.append((fn, is_tach_global))
 
     logger.info("Folders to reorganize: %s", folder_names)
 
@@ -360,7 +364,11 @@ def main():
         root_id = root_row[0]
 
         total_moved = 0
-        for folder_name in folder_names:
+        for folder_name, split_media in folder_names:
+            if not split_media:
+                logger.info("Folder '%s': tach=false (or missing), skipping reorganize", folder_name)
+                continue
+
             base_id = resolve_folder_path(conn, user_id, root_id, folder_name)
             if not base_id:
                 logger.warning("Folder '%s' not found, skipping", folder_name)

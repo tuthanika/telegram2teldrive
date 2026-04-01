@@ -103,15 +103,19 @@ def parse_args():
     for idx in sorted(seen_indices, key=int):
         fn = teldrive_cfg.get(f"folder_name{idx}", "")
         ch = teldrive_cfg.get(f"channels{idx}", "")
+        tach = teldrive_cfg.get(f"tach{idx}", False)
+        is_tach = str(tach).strip().lower() == "true" if isinstance(tach, str) else bool(tach)
         if fn:
-            numbered_pairs.append((fn, ch if ch else None))
+            numbered_pairs.append((fn, ch if ch else None, is_tach))
 
     if numbered_pairs:
         args.folder_channel_pairs = numbered_pairs
     else:
         # Single-pair mode: use the classic folder_name + optional channels
         ch = args.channels.strip() if args.channels else ""
-        args.folder_channel_pairs = [(args.folder_name, ch if ch else None)]
+        tach_global = teldrive_cfg.get("tach", False)
+        is_tach_global = str(tach_global).strip().lower() == "true" if isinstance(tach_global, str) else bool(tach_global)
+        args.folder_channel_pairs = [(args.folder_name, ch if ch else None, is_tach_global)]
 
     try:
         args.api_id = int(args.api_id)
@@ -468,13 +472,13 @@ async def iter_all_messages(client, entity, batch_size=100):
         offset_id = last_id
 
 
-async def process_channel(client, conn, user_id, channel_id, base_id, use_media_subfolders, filters, dry_run):
+async def process_channel(client, conn, user_id, channel_id, base_id, folder_mode, filters, dry_run):
     """Scan a single channel and import files.
 
-    When *use_media_subfolders* is True, files are sorted into
-    media-type sub-folders (audio/video/img/ebook/file) directly under
-    *base_id*.  Otherwise the legacy channel_<id>_<name> sub-folder is
-    used.
+    folder_mode can be:
+      - 'media_subfolders': sort into /base_id/audio, /base_id/video, etc.
+      - 'channel_subfolder': legacy /base_id/channel_<id>_<name>
+      - 'direct': insert directly into /base_id
     """
     channel = await client.get_entity(channel_id)
     channel_name = getattr(channel, "title", str(channel_id))
@@ -485,7 +489,7 @@ async def process_channel(client, conn, user_id, channel_id, base_id, use_media_
     # Pre-create / cache media-type sub-folder IDs when needed
     media_folder_cache = {}
     legacy_folder = None
-    if not use_media_subfolders:
+    if folder_mode == "channel_subfolder":
         legacy_folder = get_or_create_folder(
             conn, user_id, base_id,
             f"channel_{channel_id}_{channel_name}"[:240], dry_run,
@@ -522,15 +526,17 @@ async def process_channel(client, conn, user_id, channel_id, base_id, use_media_
             continue
 
         # Determine target folder
-        if use_media_subfolders:
+        if folder_mode == "media_subfolders":
             sf_name = get_subfolder_name(category)
             if sf_name not in media_folder_cache:
                 media_folder_cache[sf_name] = get_or_create_folder(
                     conn, user_id, base_id, sf_name, dry_run,
                 )
             target_folder = media_folder_cache[sf_name]
-        else:
+        elif folder_mode == "channel_subfolder":
             target_folder = legacy_folder
+        else:
+            target_folder = base_id
 
         insert_file(conn, user_id, channel_id, target_folder, message, file_name, dry_run)
         imported += 1
@@ -572,20 +578,19 @@ async def main():
         total_imported = 0
         total_skipped = 0
 
-        for pair_idx, (folder_name, channels_str) in enumerate(args.folder_channel_pairs, 1):
-            logger.info("=== Pair %s: folder=%r channels=%r ===", pair_idx, folder_name, channels_str or "(interactive)")
+        for pair_idx, (folder_name, channels_str, split_media) in enumerate(args.folder_channel_pairs, 1):
+            logger.info("=== Pair %s: folder=%r channels=%r tach=%r ===", pair_idx, folder_name, channels_str or "(interactive)", split_media)
             base_id = resolve_folder_path(conn, user_id, root_id, folder_name, args.dry_run)
 
-            # Determine whether to use media-type sub-folders
-            use_media_subfolders = channels_str is not None
-
             if channels_str is not None:
+                folder_mode = "media_subfolders" if split_media else "direct"
                 if channels_str.lower() == "all":
                     channel_ids = [d.entity.id async for d in client.iter_dialogs() if d.is_channel]
                 else:
                     channel_ids = parse_channel_ids(channels_str)
             else:
                 # Interactive mode – no channels specified
+                folder_mode = "channel_subfolder"
                 channel_ids = await select_channels_interactive(client)
                 if not channel_ids:
                     logger.info("No channels selected, fallback to all dialogs")
@@ -596,7 +601,7 @@ async def main():
             for channel_id in channel_ids:
                 imp, skp = await process_channel(
                     client, conn, user_id, channel_id, base_id,
-                    use_media_subfolders, filters, args.dry_run,
+                    folder_mode, filters, args.dry_run,
                 )
                 total_imported += imp
                 total_skipped += skp
