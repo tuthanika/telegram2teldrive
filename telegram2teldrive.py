@@ -104,9 +104,10 @@ def parse_args():
         fn = teldrive_cfg.get(f"folder_name{idx}", "")
         ch = teldrive_cfg.get(f"channels{idx}", "")
         tach = teldrive_cfg.get(f"tach{idx}", False)
+        rule_str = teldrive_cfg.get(f"rule{idx}", "")
         is_tach = str(tach).strip().lower() == "true" if isinstance(tach, str) else bool(tach)
         if fn:
-            numbered_pairs.append((fn, ch if ch else None, is_tach))
+            numbered_pairs.append((fn, ch if ch else None, is_tach, rule_str))
 
     if numbered_pairs:
         args.folder_channel_pairs = numbered_pairs
@@ -114,8 +115,9 @@ def parse_args():
         # Single-pair mode: use the classic folder_name + optional channels
         ch = args.channels.strip() if args.channels else ""
         tach_global = teldrive_cfg.get("tach", False)
+        rule_global = teldrive_cfg.get("rule", "")
         is_tach_global = str(tach_global).strip().lower() == "true" if isinstance(tach_global, str) else bool(tach_global)
-        args.folder_channel_pairs = [(args.folder_name, ch if ch else None, is_tach_global)]
+        args.folder_channel_pairs = [(args.folder_name, ch if ch else None, is_tach_global, rule_global)]
 
     try:
         args.api_id = int(args.api_id)
@@ -211,6 +213,17 @@ def parse_filters(filters):
     if invalid:
         raise ValueError(f"Invalid filters: {', '.join(sorted(invalid))}")
     return items
+
+
+def parse_rule_string(rule_str):
+    if not rule_str:
+        return None
+    rules = {}
+    for part in rule_str.split(","):
+        if ":" in part:
+            ext, sf = part.split(":", 1)
+            rules[ext.strip().lower().lstrip(".")] = sf.strip()
+    return rules
 
 
 def ensure_root(conn, user_id):
@@ -472,10 +485,11 @@ async def iter_all_messages(client, entity, batch_size=100):
         offset_id = last_id
 
 
-async def process_channel(client, conn, user_id, channel_id, base_id, folder_mode, filters, dry_run):
+async def process_channel(client, conn, user_id, channel_id, base_id, folder_mode, filters, dry_run, rule_dict=None):
     """Scan a single channel and import files.
 
     folder_mode can be:
+      - 'rule': route according to rule_dict mapping extension to sub-folder
       - 'media_subfolders': sort into /base_id/audio, /base_id/video, etc.
       - 'channel_subfolder': legacy /base_id/channel_<id>_<name>
       - 'direct': insert directly into /base_id
@@ -526,7 +540,16 @@ async def process_channel(client, conn, user_id, channel_id, base_id, folder_mod
             continue
 
         # Determine target folder
-        if folder_mode == "media_subfolders":
+        if folder_mode == "rule":
+            ext = os.path.splitext(file_name)[1].lower().lstrip(".")
+            if rule_dict and ext in rule_dict:
+                sf_name = rule_dict[ext]
+                if sf_name not in media_folder_cache:
+                    media_folder_cache[sf_name] = resolve_folder_path(conn, user_id, base_id, sf_name, dry_run=dry_run)
+                target_folder = media_folder_cache[sf_name]
+            else:
+                target_folder = base_id
+        elif folder_mode == "media_subfolders":
             sf_name = get_subfolder_name(category)
             if sf_name not in media_folder_cache:
                 media_folder_cache[sf_name] = get_or_create_folder(
@@ -578,12 +601,16 @@ async def main():
         total_imported = 0
         total_skipped = 0
 
-        for pair_idx, (folder_name, channels_str, split_media) in enumerate(args.folder_channel_pairs, 1):
-            logger.info("=== Pair %s: folder=%r channels=%r tach=%r ===", pair_idx, folder_name, channels_str or "(interactive)", split_media)
+        for pair_idx, (folder_name, channels_str, split_media, rule_str) in enumerate(args.folder_channel_pairs, 1):
+            logger.info("=== Pair %s: folder=%r channels=%r tach=%r rule=%r ===", pair_idx, folder_name, channels_str or "(interactive)", split_media, rule_str)
             base_id = resolve_folder_path(conn, user_id, root_id, folder_name, args.dry_run)
 
             if channels_str is not None:
-                folder_mode = "media_subfolders" if split_media else "direct"
+                if split_media:
+                    folder_mode = "rule" if rule_str else "media_subfolders"
+                else:
+                    folder_mode = "direct"
+                
                 if channels_str.lower() == "all":
                     channel_ids = [d.entity.id async for d in client.iter_dialogs() if d.is_channel]
                 else:
@@ -602,6 +629,7 @@ async def main():
                 imp, skp = await process_channel(
                     client, conn, user_id, channel_id, base_id,
                     folder_mode, filters, args.dry_run,
+                    rule_dict=parse_rule_string(rule_str)
                 )
                 total_imported += imp
                 total_skipped += skp

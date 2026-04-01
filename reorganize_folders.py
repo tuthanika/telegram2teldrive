@@ -75,6 +75,17 @@ def get_subfolder_name(category):
     return mapping.get(category, "file")
 
 
+def parse_rule_string(rule_str):
+    if not rule_str:
+        return None
+    rules = {}
+    for part in rule_str.split(","):
+        if ":" in part:
+            ext, sf = part.split(":", 1)
+            rules[ext.strip().lower().lstrip(".")] = sf.strip()
+    return rules
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────
 
 def db_connect(dsn):
@@ -208,7 +219,7 @@ def collect_sub_folder_ids(conn, user_id, parent_id):
 MEDIA_SUBFOLDER_NAMES = {"audio", "video", "img", "ebook", "file"}
 
 
-def reorganize_folder(conn, user_id, base_folder_id, base_folder_name, dry_run=False):
+def reorganize_folder(conn, user_id, base_folder_id, base_folder_name, dry_run=False, rule_dict=None):
     """Move files inside *base_folder_id* (and its channel_* sub-folders)
     into media-type sub-folders directly under *base_folder_id*."""
 
@@ -219,8 +230,14 @@ def reorganize_folder(conn, user_id, base_folder_id, base_folder_name, dry_run=F
     sub_folders = collect_sub_folder_ids(conn, user_id, base_folder_id)
     channel_files = []  # list of (file_id, file_name, mime_type, source_folder_name)
     empty_source_folders = []
+    
+    # If using custom rules, our valid subfolders include parsed rule target folders
+    valid_subfolders = MEDIA_SUBFOLDER_NAMES.copy()
+    if rule_dict:
+        valid_subfolders.update(set(rule_dict.values()))
+        
     for sf_id, sf_name in sub_folders:
-        if sf_name in MEDIA_SUBFOLDER_NAMES:
+        if sf_name in valid_subfolders:
             continue  # skip already-organized sub-folders
         files = collect_all_files(conn, user_id, sf_id)
         for f in files:
@@ -242,19 +259,32 @@ def reorganize_folder(conn, user_id, base_folder_id, base_folder_name, dry_run=F
     #    {sf_name: [file_id, ...]}
     subfolder_groups = {}
     for file_id, file_name, mime_type, source in all_files:
-        category = get_category(file_name, mime_type)
-        sf_name = get_subfolder_name(category)
+        if rule_dict:
+            ext = os.path.splitext(file_name)[1].lower().lstrip(".")
+            if ext in rule_dict:
+                sf_name = rule_dict[ext]
+            else:
+                sf_name = "."  # indicator for base_folder_id
+        else:
+            category = get_category(file_name, mime_type)
+            sf_name = get_subfolder_name(category)
+            
         subfolder_groups.setdefault(sf_name, []).append((file_id, file_name))
 
     moved = 0
     for sf_name, file_list in subfolder_groups.items():
         if dry_run:
             for _, fname in file_list:
-                logger.info("  [DRY-RUN] Would move '%s' -> /%s/%s/", fname, base_folder_name, sf_name)
+                target_path = base_folder_name if sf_name == "." else f"{base_folder_name}/{sf_name}"
+                logger.info("  [DRY-RUN] Would move '%s' -> /%s/", fname, target_path)
             moved += len(file_list)
             continue
 
-        target_parent = get_or_create_folder(conn, user_id, base_folder_id, sf_name, dry_run=False)
+        if sf_name == ".":
+            target_parent = base_folder_id
+        else:
+            target_parent = get_or_create_folder(conn, user_id, base_folder_id, sf_name, dry_run=False)
+            
         file_ids = [fid for fid, _ in file_list]
 
         # Bulk update in batches of 500
@@ -329,16 +359,18 @@ def main():
     for idx in sorted(seen_indices, key=int):
         fn = teldrive_cfg.get(f"folder_name{idx}", "")
         tach = teldrive_cfg.get(f"tach{idx}", False)
+        rule_str = teldrive_cfg.get(f"rule{idx}", "")
         is_tach = str(tach).strip().lower() == "true" if isinstance(tach, str) else bool(tach)
         if fn:
-            folder_names.append((fn, is_tach))
+            folder_names.append((fn, is_tach, rule_str))
 
     # Fallback to single folder_name
     if not folder_names:
         fn = teldrive_cfg.get("folder_name", "Imported")
         tach_global = teldrive_cfg.get("tach", False)
+        rule_global = teldrive_cfg.get("rule", "")
         is_tach_global = str(tach_global).strip().lower() == "true" if isinstance(tach_global, str) else bool(tach_global)
-        folder_names.append((fn, is_tach_global))
+        folder_names.append((fn, is_tach_global, rule_global))
 
     logger.info("Folders to reorganize: %s", folder_names)
 
@@ -364,7 +396,7 @@ def main():
         root_id = root_row[0]
 
         total_moved = 0
-        for folder_name, split_media in folder_names:
+        for folder_name, split_media, rule_str in folder_names:
             if not split_media:
                 logger.info("Folder '%s': tach=false (or missing), skipping reorganize", folder_name)
                 continue
@@ -374,7 +406,7 @@ def main():
                 logger.warning("Folder '%s' not found, skipping", folder_name)
                 continue
 
-            moved = reorganize_folder(conn, user_id, base_id, folder_name, args.dry_run)
+            moved = reorganize_folder(conn, user_id, base_id, folder_name, args.dry_run, rule_dict=parse_rule_string(rule_str))
             total_moved += moved
 
         logger.info("Done! Total files moved: %s", total_moved)
