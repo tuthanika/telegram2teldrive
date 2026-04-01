@@ -22,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 import psycopg2
 from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeFilename, InputMessagesFilterDocument
+from telethon.tl.types import DocumentAttributeFilename
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("telegram2teldrive")
@@ -271,9 +271,7 @@ def ensure_channel(conn, channel_id, channel_name, user_id, dry_run=False):
 
 
 def extract_file_name(message):
-    if not message.file:
-        return None
-    if message.file.name:
+    if message.file and message.file.name:
         return message.file.name
 
     attrs = getattr(message.document, "attributes", []) if getattr(message, "document", None) else []
@@ -281,16 +279,46 @@ def extract_file_name(message):
         if isinstance(attr, DocumentAttributeFilename):
             return attr.file_name
 
-    ext = mimetypes.guess_extension(message.file.mime_type or "") or ""
+    mime_type = None
+    if message.file:
+        mime_type = message.file.mime_type
+    elif getattr(message, "photo", None):
+        mime_type = "image/jpeg"
+    ext = mimetypes.guess_extension(mime_type or "") or ""
     return f"telegram_{message.id}{ext}"
+
+
+def get_message_media_meta(message):
+    """
+    Return (size, mime_type) for Telegram media messages.
+    Handles cases where message.file is missing but document/photo still exists.
+    """
+    if message.file:
+        return getattr(message.file, "size", None), getattr(message.file, "mime_type", None)
+
+    if getattr(message, "document", None):
+        doc = message.document
+        return getattr(doc, "size", None), getattr(doc, "mime_type", None)
+
+    if getattr(message, "photo", None):
+        photo = message.photo
+        sizes = getattr(photo, "sizes", None) or []
+        size = None
+        for p in sizes:
+            p_size = getattr(p, "size", None)
+            if p_size is not None:
+                size = p_size
+        return size, "image/jpeg"
+
+    return None, None
 
 
 def insert_file(conn, user_id, channel_id, parent_id, message, file_name, dry_run=False):
     if dry_run:
         return True
 
-    file_size = getattr(message.file, "size", None)
-    mime_type = getattr(message.file, "mime_type", None) or "application/octet-stream"
+    file_size, mime_type = get_message_media_meta(message)
+    mime_type = mime_type or "application/octet-stream"
     category = get_category(file_name, mime_type)
     msg_time = message.date.astimezone(timezone.utc) if message.date else datetime.now(timezone.utc)
 
@@ -363,6 +391,27 @@ async def select_channels_interactive(client):
     return [channels[i][0] for i in sorted(idxs)]
 
 
+async def iter_all_messages(client, entity, batch_size=100):
+    """
+    Iterate the full history with explicit pagination.
+    This avoids Telethon-version differences in iter_messages defaults and
+    makes scan boundaries easier to reason about.
+    """
+    offset_id = 0
+    while True:
+        messages = await client.get_messages(entity, limit=batch_size, offset_id=offset_id)
+        if not messages:
+            break
+
+        for message in messages:
+            yield message
+
+        last_id = messages[-1].id
+        if not last_id or last_id == offset_id:
+            break
+        offset_id = last_id
+
+
 async def main():
     args = parse_args()
     filters = parse_filters(args.filters)
@@ -409,22 +458,27 @@ async def main():
             imported = 0
             skipped = 0
             processed = 0
+            media_seen = 0
 
-            async for message in client.iter_messages(channel_id, filter=InputMessagesFilterDocument):
+            # Scan full channel history with explicit pagination (compatible across
+            # Telethon versions and avoids implicit/default limit surprises).
+            async for message in iter_all_messages(client, channel, batch_size=200):
                 processed += 1
                 if processed % 100 == 0:
-                    logger.info("Channel %s progress: %s documents", channel_id, processed)
+                    logger.info("Channel %s progress: scanned=%s media=%s", channel_id, processed, media_seen)
 
-                if not message.file:
+                if not (message.file or getattr(message, "document", None) or getattr(message, "photo", None)):
                     skipped += 1
                     continue
 
+                media_seen += 1
                 file_name = extract_file_name(message)
                 if not file_name:
                     skipped += 1
                     continue
 
-                category = get_category(file_name, message.file.mime_type)
+                _, mime_type = get_message_media_meta(message)
+                category = get_category(file_name, mime_type)
                 if filters is not None and category not in filters:
                     skipped += 1
                     continue
@@ -439,9 +493,20 @@ async def main():
             conn.commit()
             total_imported += imported
             total_skipped += skipped
-            logger.info("Channel %s done: imported=%s skipped=%s", channel_id, imported, skipped)
+            logger.info(
+                "Channel %s done: scanned_total=%s, media_total=%s, imported=%s, skipped=%s",
+                channel_id,
+                processed,
+                media_seen,
+                imported,
+                skipped,
+            )
 
-        logger.info("Finished: imported=%s skipped=%s", total_imported, total_skipped)
+        logger.info(
+            "Finished: imported=%s skipped=%s",
+            total_imported,
+            total_skipped,
+        )
 
     finally:
         conn.close()
