@@ -4,11 +4,13 @@
 This script is adapted for the current TelDrive schema:
 - Uses PostgreSQL schema `teldrive` (via search_path).
 - Writes to teldrive.files / teldrive.channels compatible with current columns.
-- Creates folder tree: /root/<folder_name>/channel_<id>_<name>
+- Default mode: /root/<folder_name>/channel_<id>_<name>
+- With explicit channels: /root/<folder_name>/<media_type>
 """
 
 import argparse
 import json
+import re
 import logging
 import mimetypes
 import os
@@ -86,9 +88,30 @@ def parse_args():
     args.db_password = args.db_password or os.getenv("DB_PASSWORD") or get_cfg(config, "database", "password")
 
     args.folder_name = args.folder_name or os.getenv("FOLDER_NAME") or get_cfg(config, "teldrive", "folder_name", "Imported")
-    args.channels = args.channels or os.getenv("CHANNELS") or get_cfg(config, "telegram", "channels", "")
+    args.channels = args.channels or os.getenv("CHANNELS") or get_cfg(config, "teldrive", "channels", "") or get_cfg(config, "telegram", "channels", "")
     args.filters = args.filters or os.getenv("FILTERS") or "all"
     args.session = args.session or os.getenv("SESSION_NAME") or get_cfg(config, "telegram", "session", "telegram2teldrive")
+
+    # ── Detect numbered folder/channel pairs (folder_name1/channels1, …) ──
+    teldrive_cfg = config.get("teldrive", {})
+    numbered_pairs = []
+    seen_indices = set()
+    for key in teldrive_cfg:
+        m = re.match(r"^folder_name(\d+)$", key)
+        if m:
+            seen_indices.add(m.group(1))
+    for idx in sorted(seen_indices, key=int):
+        fn = teldrive_cfg.get(f"folder_name{idx}", "")
+        ch = teldrive_cfg.get(f"channels{idx}", "")
+        if fn:
+            numbered_pairs.append((fn, ch if ch else None))
+
+    if numbered_pairs:
+        args.folder_channel_pairs = numbered_pairs
+    else:
+        # Single-pair mode: use the classic folder_name + optional channels
+        ch = args.channels.strip() if args.channels else ""
+        args.folder_channel_pairs = [(args.folder_name, ch if ch else None)]
 
     try:
         args.api_id = int(args.api_id)
@@ -154,9 +177,25 @@ def get_category(file_name, mime_type=None):
         return "audio"
     if mime_type.startswith("text/") or mime_type == "application/pdf":
         return "document"
+    ext = os.path.splitext(file_name)[1].lower()
+    if mime_type == "application/epub+zip" or ext in {".epub", ".mobi", ".azw", ".azw3", ".djvu", ".fb2"}:
+        return "document"
     if mime_type in {"application/zip", "application/x-tar", "application/x-bzip2", "application/x-7z-compressed"}:
         return "archive"
     return "other"
+
+
+def get_subfolder_name(category):
+    """Map file category to media-type sub-folder name."""
+    mapping = {
+        "audio": "audio",
+        "video": "video",
+        "image": "img",
+        "document": "ebook",
+        "archive": "file",
+        "other": "file",
+    }
+    return mapping.get(category, "file")
 
 
 def parse_filters(filters):
@@ -197,6 +236,10 @@ def ensure_root(conn, user_id):
 
 
 def get_or_create_folder(conn, user_id, parent_id, folder_name, dry_run=False):
+    # In dry-run mode, skip all DB calls to avoid passing fake IDs as UUIDs
+    if dry_run:
+        return f"dryrun:{folder_name}"
+
     row = fetch_one(
         conn,
         """
@@ -209,9 +252,6 @@ def get_or_create_folder(conn, user_id, parent_id, folder_name, dry_run=False):
     )
     if row:
         return row[0]
-
-    if dry_run:
-        return f"dryrun:{folder_name}"
 
     execute(
         conn,
@@ -412,6 +452,92 @@ async def iter_all_messages(client, entity, batch_size=100):
         offset_id = last_id
 
 
+async def process_channel(client, conn, user_id, channel_id, base_id, use_media_subfolders, filters, dry_run):
+    """Scan a single channel and import files.
+
+    When *use_media_subfolders* is True, files are sorted into
+    media-type sub-folders (audio/video/img/ebook/file) directly under
+    *base_id*.  Otherwise the legacy channel_<id>_<name> sub-folder is
+    used.
+    """
+    channel = await client.get_entity(channel_id)
+    channel_name = getattr(channel, "title", str(channel_id))
+    logger.info("Scanning channel %s (%s)", channel_name, channel_id)
+
+    ensure_channel(conn, channel_id, channel_name, user_id, dry_run)
+
+    # Pre-create / cache media-type sub-folder IDs when needed
+    media_folder_cache = {}
+    legacy_folder = None
+    if not use_media_subfolders:
+        legacy_folder = get_or_create_folder(
+            conn, user_id, base_id,
+            f"channel_{channel_id}_{channel_name}"[:240], dry_run,
+        )
+
+    imported = 0
+    skipped = 0
+    processed = 0
+    media_seen = 0
+
+    async for message in iter_all_messages(client, channel, batch_size=200):
+        processed += 1
+        if processed % 100 == 0:
+            logger.info("Channel %s progress: scanned=%s media=%s", channel_id, processed, media_seen)
+
+        if not (message.file or getattr(message, "document", None) or getattr(message, "photo", None)):
+            skipped += 1
+            continue
+
+        media_seen += 1
+        file_name = extract_file_name(message)
+        if not file_name:
+            skipped += 1
+            continue
+
+        _, mime_type = get_message_media_meta(message)
+        category = get_category(file_name, mime_type)
+        if filters is not None and category not in filters:
+            skipped += 1
+            continue
+
+        if file_exists(conn, user_id, channel_id, message.id):
+            skipped += 1
+            continue
+
+        # Determine target folder
+        if use_media_subfolders:
+            sf_name = get_subfolder_name(category)
+            if sf_name not in media_folder_cache:
+                media_folder_cache[sf_name] = get_or_create_folder(
+                    conn, user_id, base_id, sf_name, dry_run,
+                )
+            target_folder = media_folder_cache[sf_name]
+        else:
+            target_folder = legacy_folder
+
+        insert_file(conn, user_id, channel_id, target_folder, message, file_name, dry_run)
+        imported += 1
+
+    conn.commit()
+    logger.info(
+        "Channel %s done: scanned_total=%s, media_total=%s, imported=%s, skipped=%s",
+        channel_id, processed, media_seen, imported, skipped,
+    )
+    return imported, skipped
+
+
+def parse_channel_ids(channels_str):
+    """Parse a channels string that may use ',' or ';' as separator."""
+    raw = re.split(r"[,;]", channels_str)
+    ids = []
+    for part in raw:
+        part = part.strip()
+        if part:
+            ids.append(int(part))
+    return ids
+
+
 async def main():
     args = parse_args()
     filters = parse_filters(args.filters)
@@ -426,87 +552,40 @@ async def main():
         logger.info("User: %s (%s)", me.first_name, user_id)
 
         root_id = ensure_root(conn, user_id)
-        base_id = get_or_create_folder(conn, user_id, root_id, args.folder_name, args.dry_run)
-
-        if args.channels and args.channels.lower() != "all":
-            channel_ids = [int(x.strip()) for x in args.channels.split(",") if x.strip()]
-        else:
-            channel_ids = await select_channels_interactive(client)
-            if not channel_ids:
-                logger.info("No channels selected, fallback to all dialogs")
-                channel_ids = [d.entity.id async for d in client.iter_dialogs() if d.is_channel]
-
-        logger.info("Selected channels: %s", channel_ids)
 
         total_imported = 0
         total_skipped = 0
 
-        for channel_id in channel_ids:
-            channel = await client.get_entity(channel_id)
-            channel_name = getattr(channel, "title", str(channel_id))
-            logger.info("Scanning channel %s (%s)", channel_name, channel_id)
+        for pair_idx, (folder_name, channels_str) in enumerate(args.folder_channel_pairs, 1):
+            logger.info("=== Pair %s: folder=%r channels=%r ===", pair_idx, folder_name, channels_str or "(interactive)")
+            base_id = get_or_create_folder(conn, user_id, root_id, folder_name, args.dry_run)
 
-            ensure_channel(conn, channel_id, channel_name, user_id, args.dry_run)
-            channel_folder = get_or_create_folder(
-                conn,
-                user_id,
-                base_id,
-                f"channel_{channel_id}_{channel_name}"[:240],
-                args.dry_run,
-            )
+            # Determine whether to use media-type sub-folders
+            use_media_subfolders = channels_str is not None
 
-            imported = 0
-            skipped = 0
-            processed = 0
-            media_seen = 0
+            if channels_str is not None:
+                if channels_str.lower() == "all":
+                    channel_ids = [d.entity.id async for d in client.iter_dialogs() if d.is_channel]
+                else:
+                    channel_ids = parse_channel_ids(channels_str)
+            else:
+                # Interactive mode – no channels specified
+                channel_ids = await select_channels_interactive(client)
+                if not channel_ids:
+                    logger.info("No channels selected, fallback to all dialogs")
+                    channel_ids = [d.entity.id async for d in client.iter_dialogs() if d.is_channel]
 
-            # Scan full channel history with explicit pagination (compatible across
-            # Telethon versions and avoids implicit/default limit surprises).
-            async for message in iter_all_messages(client, channel, batch_size=200):
-                processed += 1
-                if processed % 100 == 0:
-                    logger.info("Channel %s progress: scanned=%s media=%s", channel_id, processed, media_seen)
+            logger.info("Selected channels: %s", channel_ids)
 
-                if not (message.file or getattr(message, "document", None) or getattr(message, "photo", None)):
-                    skipped += 1
-                    continue
+            for channel_id in channel_ids:
+                imp, skp = await process_channel(
+                    client, conn, user_id, channel_id, base_id,
+                    use_media_subfolders, filters, args.dry_run,
+                )
+                total_imported += imp
+                total_skipped += skp
 
-                media_seen += 1
-                file_name = extract_file_name(message)
-                if not file_name:
-                    skipped += 1
-                    continue
-
-                _, mime_type = get_message_media_meta(message)
-                category = get_category(file_name, mime_type)
-                if filters is not None and category not in filters:
-                    skipped += 1
-                    continue
-
-                if file_exists(conn, user_id, channel_id, message.id):
-                    skipped += 1
-                    continue
-
-                insert_file(conn, user_id, channel_id, channel_folder, message, file_name, args.dry_run)
-                imported += 1
-
-            conn.commit()
-            total_imported += imported
-            total_skipped += skipped
-            logger.info(
-                "Channel %s done: scanned_total=%s, media_total=%s, imported=%s, skipped=%s",
-                channel_id,
-                processed,
-                media_seen,
-                imported,
-                skipped,
-            )
-
-        logger.info(
-            "Finished: imported=%s skipped=%s",
-            total_imported,
-            total_skipped,
-        )
+        logger.info("Finished: imported=%s skipped=%s", total_imported, total_skipped)
 
     finally:
         conn.close()
